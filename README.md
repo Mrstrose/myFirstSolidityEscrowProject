@@ -1,2 +1,351 @@
-# myFirstSolidityEscrowProject
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.30;
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+contract EscrowMarketPlace is Ownable, AccessControl, ReentrancyGuard{
+
+    bytes32 public constant ARBITRATOR_ROLE = keccak256("ARBITRATOR_ROLE");
+
+    uint256 private _transactionIdCounter;
+
+    uint256 public constant DEPOSIT = 1 ether;
+
+    uint256 public feeBasisPoints = 250; // 2.5%
+
+    uint256 public constant MAX_FEE_BASIS_POINTS = 1000;  // 10% hard cap
+
+    uint256 private totalEscrowed;
+
+    address public feeRecipient;
+
+    event TransactionCreated(uint id, address creator, string item);
+    event BoughtItem(uint256 id, address buyer, address seller);
+    event DepositedFunds(address sender, uint256 amount, uint256 timestamp);
+    event DeliveryConfirmed(uint256 id);
+    event RefundIssued(uint256 id);
+    event DisputeRaised(uint256 id);
+    event DisputeResolved(uint256 id, address winner);
+    event EscrowCanceled(uint256 id, address initiator);
+    event FeeUpdated(uint256 feeBasisPoints, uint256 newFee);
+    event FeeRecipientUpdated(address feeRecipient, address newRecipient);
+
+    error TransactionFailed();
+    error Usedeposit();
+
+    enum Status{
+        Created,    // > 0
+        Pending,    // > 1
+        Completed,  // > 2
+        Refunded,   // > 3
+        Disputed,   // > 4
+        Canceled,   // > 5
+        Resolved    // > 6
+    }
+
+    // Status public status;
+
+    struct Transaction{
+        uint256 id;
+        uint256 amount;
+        uint256 deadline;
+        address buyer;
+        address seller;
+        address arbitrator;
+        string item;
+        bool itemSold;
+        bool buyerSatisfied;
+        Status status;
+    }
+
+    mapping(address => bool) internal isBuyer;
+    mapping(address => bool) internal isSeller;
+    mapping(uint256 =>mapping(address => bool)) internal productOk;
+    mapping(uint256 => Transaction) public transactions;
+    mapping(address => uint256) internal pendingWithdrawals;
+    mapping(address => uint256) internal deposits;
+    mapping(address => bool) internal hasDeposited;
+    mapping(address => bool) internal lockedInTransaction;
+
+    modifier onlySeller() {
+        require(isSeller[msg.sender], "You are not a registered Seller");
+        _;
+    }
+
+    modifier onlyArbitrator {
+        require(
+            hasRole(ARBITRATOR_ROLE, msg.sender),
+            "Not arbitrator"
+        );
+        _;
+    }
+
+    constructor(address initialOwner) Ownable(initialOwner) {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        feeRecipient = initialOwner;
+        _transactionIdCounter = 1;
+    }
+
+    function setFee(uint256 newFee) external onlyOwner {
+        require(newFee <= MAX_FEE_BASIS_POINTS, "Exceeds max fee");
+        emit FeeUpdated(feeBasisPoints, newFee);
+        feeBasisPoints = newFee;
+    }
+
+    function setFeeRecipient(address newRecipient) external onlyOwner {
+        require(newRecipient != address(0), "Zero address");
+        emit FeeRecipientUpdated(feeRecipient, newRecipient);
+        feeRecipient = newRecipient;
+    }
+
+    function grantArbitratorRole(address account) external onlyOwner{
+        _grantRole(ARBITRATOR_ROLE, account);
+    }
+
+    function createTransaction(
+        uint256 _amount,
+        uint256 _deadline,
+        address _arbitrator,
+        string memory _item
+        ) external {
+            require(_amount > 0, "Amount must be positive");
+            require(_deadline > 0, "Duration must be positive");
+            require(hasDeposited[msg.sender], "Creator has not deposited");
+            require(hasRole(ARBITRATOR_ROLE, _arbitrator), "Invalid arbitrator");
+
+            uint256 newId = _transactionIdCounter; 
+
+            transactions[newId] = Transaction({
+            id: newId,
+            amount: _amount,
+            deadline: block.timestamp + _deadline,
+            buyer: address(0),
+            seller: msg.sender,
+            arbitrator: _arbitrator,
+            item: _item,
+            itemSold: false,
+            buyerSatisfied:false,
+            status: Status.Created
+            });
+
+        _transactionIdCounter++; // increment AFTER storing
+        isSeller[msg.sender] = true;
+        lockedInTransaction[msg.sender] = true;
+        emit TransactionCreated(newId, msg.sender, _item);
+    } 
+
+    function deposit() external payable nonReentrant {
+        require(msg.value == DEPOSIT, "Must send Deposit");
+
+        deposits[msg.sender] += msg.value;
+
+        hasDeposited[msg.sender] = true;
+
+        emit DepositedFunds(msg.sender, msg.value, block.timestamp);
+    }
+
+    function buyItem(uint256 _id) external payable nonReentrant {
+        require(hasDeposited[msg.sender], "Buyer has not deposited");
+        require(transactions[_id].seller != address(0), "Transaction does not exist");
+
+        Transaction storage transact = transactions[_id];
+
+        require(transact.seller != msg.sender, "Seller cannot buy own item");
+        require(!transact.itemSold, "Item already sold");
+        require(transact.status == Status.Created, "Invalid status");
+
+        require(msg.value == transact.amount, "Incorrect payment amount");
+
+        transact.buyer = msg.sender;
+        
+        transact.status = Status.Pending;
+
+        totalEscrowed += msg.value;
+        pendingWithdrawals[address(this)] += msg.value;
+
+        isBuyer[msg.sender] = true;
+        transact.itemSold = true;
+
+        emit BoughtItem(_id, msg.sender, transact.seller);
+    }
+
+    function approveDelivery(uint256 _id) external nonReentrant {
+        require(transactions[_id].seller != address(0), "Transaction does not exist");
+        Transaction storage transact = transactions[_id];
+
+        require(transact.buyer == msg.sender, "Only buyer can approve delivery");
+
+        require(transact.status == Status.Pending, "Invalid transaction state");
+
+        require(transact.itemSold == true, "Item not purchased");
+
+        transact.buyerSatisfied = true;
+        transact.status = Status.Completed;
+
+        productOk[_id][msg.sender] = true;
+
+        uint256 fee = (transact.amount * feeBasisPoints) / 10000;
+        uint256 sellerAmount = transact.amount - fee;
+
+        totalEscrowed -= transact.amount;
+        pendingWithdrawals[address(this)] -= transact.amount;
+        pendingWithdrawals[transact.seller] += sellerAmount;
+        pendingWithdrawals[feeRecipient] += fee;
+
+        lockedInTransaction[transact.seller] = false;
+
+        emit DeliveryConfirmed(_id);
+    }
+
+    function claimRefund(uint256 _id) external nonReentrant {
+        require(transactions[_id].seller != address(0), "Transaction does not exist");
+        Transaction storage transact = transactions[_id];
+
+        require(transact.buyer == msg.sender, "Not the buyer");
+        require(transact.status == Status.Pending, "Invalid state");
+        require(block.timestamp > transact.deadline, "Wait for deadline to elapse");
+
+        transact.status = Status.Refunded;
+
+        pendingWithdrawals[address(this)] -= transact.amount;
+        pendingWithdrawals[transact.buyer] += transact.amount;
+    }
+
+
+    function withdrawFunds() external nonReentrant {
+        require(hasDeposited[msg.sender],"Caller did not deposit");
+        require(!lockedInTransaction[msg.sender]);
+
+        uint256 amount = deposits[msg.sender];
+
+        require(amount > 0, "Nothing to withdraw");
+        require(address(this).balance >= amount, "Insufficient contract balance");
+
+        deposits[msg.sender] = 0;
+        hasDeposited[msg.sender] = false;
+
+        (bool success,) = payable(msg.sender).call{value: amount}("");
+
+        if (!success) {
+            revert TransactionFailed();
+        }
+    }
+
+    function withdraw() external nonReentrant {
+        uint256 amount = pendingWithdrawals[msg.sender];
+
+        require(amount > 0, "Nothing to withdraw");
+
+        pendingWithdrawals[msg.sender] = 0;
+
+        (bool success,) = payable(msg.sender).call{value: amount}("");
+        require(success, "Transfer failed");
+    }
+
+    function refundBuyer(uint256 _id) external onlySeller nonReentrant {
+        Transaction storage transact = transactions[_id];
+
+        require(transact.seller == msg.sender, "Not transaction seller");
+
+        require(transact.itemSold == true, "Buyer never purchased");
+
+        require(transact.status == Status.Canceled, "Transaction not canceled");
+
+        require(transact.buyer != address(0), "No buyer to refund");
+
+        transact.status = Status.Refunded;
+
+        totalEscrowed -= transact.amount;
+        pendingWithdrawals[address(this)] -= transact.amount;
+        pendingWithdrawals[transact.buyer] += transact.amount;
+
+        lockedInTransaction[transact.seller] = false;
+
+        emit RefundIssued(_id);
+    }
+
+
+        function cancelEscrow(uint256 _id) external nonReentrant {
+            Transaction storage transact = transactions[_id];
+
+            require(transact.seller == msg.sender, "Not transaction seller");
+            require(transact.status == Status.Created, "Cannot cancel after purchase");
+
+            transact.status = Status.Canceled;
+
+            if (transact.itemSold) {
+                transact.itemSold = false;
+
+                require(pendingWithdrawals[address(this)] >= transact.amount, "Insufficient escrow balance");
+
+                totalEscrowed -= transact.amount;
+                pendingWithdrawals[address(this)] -= transact.amount;
+                pendingWithdrawals[transact.buyer] += transact.amount;
+            }
+
+            lockedInTransaction[transact.seller] = false;
+
+            emit EscrowCanceled(_id, msg.sender);
+    }
+
+
+    function raiseDispute(uint256 _id) external {
+        require(transactions[_id].seller != address(0), "Transaction does not exist");
+
+        Transaction storage transact = transactions[_id];
+
+        require(transact.buyer == msg.sender, "Not this transaction's buyer");
+
+        require(transact.status == Status.Pending, "Can only dispute pending transactions");
+
+        transact.status = Status.Disputed;
+
+        emit DisputeRaised(_id);
+    }
+
+    function resolveDispute(uint256 _id, address _winner)
+        external
+        onlyArbitrator{
+
+        require(_winner != address(0), "Enter a valid address");
+
+        Transaction storage transact = transactions[_id];
+
+        require(msg.sender == transact.arbitrator);
+
+
+        require(transact.status == Status.Disputed, "No active dispute");
+
+        require(_winner == transact.buyer || _winner == transact.seller, "Invalid winner");
+
+        transact.status = Status.Resolved;
+
+        if (_winner == transact.buyer) {
+
+            totalEscrowed -= transact.amount;
+            pendingWithdrawals[address(this)] -= transact.amount;
+            pendingWithdrawals[transact.buyer] += transact.amount;
+        } else {
+
+            totalEscrowed -= transact.amount;
+            pendingWithdrawals[address(this)] -= transact.amount;
+            pendingWithdrawals[transact.seller] += transact.amount;
+        }
+
+        emit DisputeResolved(_id, _winner);
+    }
+    
+    function getEscrowDetails(uint256 _id) external view 
+        returns (address buyer, address seller, uint256 amount, Status status) {
+
+            Transaction storage transact = transactions[_id];
+            
+            return (transact.buyer, transact.seller, transact.amount, transact.status);     
+    }
+
+    receive() external payable { 
+        revert Usedeposit(); 
+    }
+}# myFirstSolidityEscrowProject
 This is my first attempt on writing a professional Escrow contract using solidity
