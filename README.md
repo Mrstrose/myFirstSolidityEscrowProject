@@ -1,351 +1,152 @@
-// SPDX-License-Identifier: MIT
-pragma solidity 0.8.30;
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-
-contract EscrowMarketPlace is Ownable, AccessControl, ReentrancyGuard{
-
-    bytes32 public constant ARBITRATOR_ROLE = keccak256("ARBITRATOR_ROLE");
-
-    uint256 private _transactionIdCounter;
-
-    uint256 public constant DEPOSIT = 1 ether;
-
-    uint256 public feeBasisPoints = 250; // 2.5%
-
-    uint256 public constant MAX_FEE_BASIS_POINTS = 1000;  // 10% hard cap
-
-    uint256 private totalEscrowed;
-
-    address public feeRecipient;
-
-    event TransactionCreated(uint id, address creator, string item);
-    event BoughtItem(uint256 id, address buyer, address seller);
-    event DepositedFunds(address sender, uint256 amount, uint256 timestamp);
-    event DeliveryConfirmed(uint256 id);
-    event RefundIssued(uint256 id);
-    event DisputeRaised(uint256 id);
-    event DisputeResolved(uint256 id, address winner);
-    event EscrowCanceled(uint256 id, address initiator);
-    event FeeUpdated(uint256 feeBasisPoints, uint256 newFee);
-    event FeeRecipientUpdated(address feeRecipient, address newRecipient);
-
-    error TransactionFailed();
-    error Usedeposit();
-
-    enum Status{
-        Created,    // > 0
-        Pending,    // > 1
-        Completed,  // > 2
-        Refunded,   // > 3
-        Disputed,   // > 4
-        Canceled,   // > 5
-        Resolved    // > 6
-    }
-
-    // Status public status;
-
-    struct Transaction{
-        uint256 id;
-        uint256 amount;
-        uint256 deadline;
-        address buyer;
-        address seller;
-        address arbitrator;
-        string item;
-        bool itemSold;
-        bool buyerSatisfied;
-        Status status;
-    }
-
-    mapping(address => bool) internal isBuyer;
-    mapping(address => bool) internal isSeller;
-    mapping(uint256 =>mapping(address => bool)) internal productOk;
-    mapping(uint256 => Transaction) public transactions;
-    mapping(address => uint256) internal pendingWithdrawals;
-    mapping(address => uint256) internal deposits;
-    mapping(address => bool) internal hasDeposited;
-    mapping(address => bool) internal lockedInTransaction;
-
-    modifier onlySeller() {
-        require(isSeller[msg.sender], "You are not a registered Seller");
-        _;
-    }
-
-    modifier onlyArbitrator {
-        require(
-            hasRole(ARBITRATOR_ROLE, msg.sender),
-            "Not arbitrator"
-        );
-        _;
-    }
-
-    constructor(address initialOwner) Ownable(initialOwner) {
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        feeRecipient = initialOwner;
-        _transactionIdCounter = 1;
-    }
-
-    function setFee(uint256 newFee) external onlyOwner {
-        require(newFee <= MAX_FEE_BASIS_POINTS, "Exceeds max fee");
-        emit FeeUpdated(feeBasisPoints, newFee);
-        feeBasisPoints = newFee;
-    }
-
-    function setFeeRecipient(address newRecipient) external onlyOwner {
-        require(newRecipient != address(0), "Zero address");
-        emit FeeRecipientUpdated(feeRecipient, newRecipient);
-        feeRecipient = newRecipient;
-    }
-
-    function grantArbitratorRole(address account) external onlyOwner{
-        _grantRole(ARBITRATOR_ROLE, account);
-    }
+# Escrow Marketplace Smart Contract
 
-    function createTransaction(
-        uint256 _amount,
-        uint256 _deadline,
-        address _arbitrator,
-        string memory _item
-        ) external {
-            require(_amount > 0, "Amount must be positive");
-            require(_deadline > 0, "Duration must be positive");
-            require(hasDeposited[msg.sender], "Creator has not deposited");
-            require(hasRole(ARBITRATOR_ROLE, _arbitrator), "Invalid arbitrator");
+A decentralized escrow marketplace built with Solidity that enables secure peer-to-peer transactions between buyers and sellers using blockchain technology.
 
-            uint256 newId = _transactionIdCounter; 
+## Overview
 
-            transactions[newId] = Transaction({
-            id: newId,
-            amount: _amount,
-            deadline: block.timestamp + _deadline,
-            buyer: address(0),
-            seller: msg.sender,
-            arbitrator: _arbitrator,
-            item: _item,
-            itemSold: false,
-            buyerSatisfied:false,
-            status: Status.Created
-            });
+This smart contract creates a trustless marketplace where cryptocurrency funds are held in escrow until both parties fulfill their obligations. An arbitrator can resolve disputes if needed, ensuring protection for all participants.
 
-        _transactionIdCounter++; // increment AFTER storing
-        isSeller[msg.sender] = true;
-        lockedInTransaction[msg.sender] = true;
-        emit TransactionCreated(newId, msg.sender, _item);
-    } 
+## How It Works
 
-    function deposit() external payable nonReentrant {
-        require(msg.value == DEPOSIT, "Must send Deposit");
+### User Workflow
 
-        deposits[msg.sender] += msg.value;
+1. **Deposit**: Users deposit 1 ETH to participate in the marketplace
+2. **Create Listing** (Sellers): Specify an item, price, deadline, and arbitrator
+3. **Purchase** (Buyers): Buy items by sending the exact amount—funds are held in escrow
+4. **Delivery Confirmation** (Buyers): Approve delivery when satisfied with the item
+5. **Withdrawal**: Receive funds after transactions complete
 
-        hasDeposited[msg.sender] = true;
+### Transaction States
 
-        emit DepositedFunds(msg.sender, msg.value, block.timestamp);
-    }
+- **Created**: Listing is active, waiting for a buyer
+- **Pending**: Item purchased, awaiting delivery confirmation or dispute
+- **Completed**: Buyer approved delivery, seller and buyer can withdraw funds
+- **Refunded**: Buyer requested refund after deadline or transaction was canceled
+- **Disputed**: Buyer raised a dispute waiting for arbitrator resolution
+- **Canceled**: Seller canceled the transaction before purchase
+- **Resolved**: Arbitrator resolved the dispute and assigned funds
 
-    function buyItem(uint256 _id) external payable nonReentrant {
-        require(hasDeposited[msg.sender], "Buyer has not deposited");
-        require(transactions[_id].seller != address(0), "Transaction does not exist");
+## Key Features
 
-        Transaction storage transact = transactions[_id];
+✅ **Secure Transactions**: Uses `ReentrancyGuard` to prevent reentrancy attacks  
+✅ **Dispute Resolution**: Arbitrators can settle disagreements between parties  
+✅ **Configurable Fees**: Platform fees are adjustable (capped at 10%)  
+✅ **Access Control**: Role-based permissions for sellers, buyers, and arbitrators  
+✅ **Automatic Refunds**: Buyers can claim refunds after the deadline expires  
+✅ **Fund Tracking**: Separate tracking of deposits and pending withdrawals  
 
-        require(transact.seller != msg.sender, "Seller cannot buy own item");
-        require(!transact.itemSold, "Item already sold");
-        require(transact.status == Status.Created, "Invalid status");
+## Contract Parameters
 
-        require(msg.value == transact.amount, "Incorrect payment amount");
+| Parameter | Value |
+|-----------|-------|
+| Solidity Version | 0.8.30 |
+| Required Deposit | 1 ETH |
+| Default Fee | 2.5% |
+| Maximum Fee Cap | 10% |
 
-        transact.buyer = msg.sender;
-        
-        transact.status = Status.Pending;
+## Core Functions
 
-        totalEscrowed += msg.value;
-        pendingWithdrawals[address(this)] += msg.value;
+### For Buyers & Sellers
 
-        isBuyer[msg.sender] = true;
-        transact.itemSold = true;
+- `deposit()`: Deposit 1 ETH to join the marketplace
+- `createTransaction()`: Create a new escrow transaction
+- `buyItem(uint256 _id)`: Purchase an item
+- `approveDelivery(uint256 _id)`: Confirm item delivery (buyer only)
+- `withdrawFunds()`: Withdraw your initial deposit
+- `withdraw()`: Withdraw earnings or refunds
 
-        emit BoughtItem(_id, msg.sender, transact.seller);
-    }
+### For Sellers
 
-    function approveDelivery(uint256 _id) external nonReentrant {
-        require(transactions[_id].seller != address(0), "Transaction does not exist");
-        Transaction storage transact = transactions[_id];
+- `cancelEscrow(uint256 _id)`: Cancel a transaction before it's purchased
+- `refundBuyer(uint256 _id)`: Issue a refund for a canceled transaction
 
-        require(transact.buyer == msg.sender, "Only buyer can approve delivery");
+### For Buyers
 
-        require(transact.status == Status.Pending, "Invalid transaction state");
+- `claimRefund(uint256 _id)`: Claim refund after deadline expires
+- `raiseDispute(uint256 _id)`: Raise a dispute during pending transactions
 
-        require(transact.itemSold == true, "Item not purchased");
+### For Arbitrators
 
-        transact.buyerSatisfied = true;
-        transact.status = Status.Completed;
+- `resolveDispute(uint256 _id, address _winner)`: Settle disputes by awarding funds to buyer or seller
 
-        productOk[_id][msg.sender] = true;
+### For Admin
 
-        uint256 fee = (transact.amount * feeBasisPoints) / 10000;
-        uint256 sellerAmount = transact.amount - fee;
+- `setFee(uint256 newFee)`: Update platform fee
+- `setFeeRecipient(address newRecipient)`: Change fee recipient address
+- `grantArbitratorRole(address account)`: Add new arbitrators
 
-        totalEscrowed -= transact.amount;
-        pendingWithdrawals[address(this)] -= transact.amount;
-        pendingWithdrawals[transact.seller] += sellerAmount;
-        pendingWithdrawals[feeRecipient] += fee;
+### Utilities
 
-        lockedInTransaction[transact.seller] = false;
+- `getEscrowDetails(uint256 _id)`: View transaction details (buyer, seller, amount, status)
 
-        emit DeliveryConfirmed(_id);
-    }
+## Security Features
 
-    function claimRefund(uint256 _id) external nonReentrant {
-        require(transactions[_id].seller != address(0), "Transaction does not exist");
-        Transaction storage transact = transactions[_id];
+- **Reentrancy Protection**: All functions that transfer funds use `nonReentrant` modifier
+- **Role-Based Access Control**: Uses OpenZeppelin's `AccessControl` for secure permissions
+- **Ownership**: Owner-controlled fee management and arbitrator assignments
+- **Input Validation**: Comprehensive checks on amounts, addresses, and transaction states
 
-        require(transact.buyer == msg.sender, "Not the buyer");
-        require(transact.status == Status.Pending, "Invalid state");
-        require(block.timestamp > transact.deadline, "Wait for deadline to elapse");
+## Installation & Deployment
 
-        transact.status = Status.Refunded;
+### Prerequisites
 
-        pendingWithdrawals[address(this)] -= transact.amount;
-        pendingWithdrawals[transact.buyer] += transact.amount;
-    }
+- Solidity compiler 0.8.30 or higher
+- OpenZeppelin contracts library
 
+### Dependencies
 
-    function withdrawFunds() external nonReentrant {
-        require(hasDeposited[msg.sender],"Caller did not deposit");
-        require(!lockedInTransaction[msg.sender]);
+```
+@openzeppelin/contracts/access/Ownable.sol
+@openzeppelin/contracts/access/AccessControl.sol
+@openzeppelin/contracts/utils/ReentrancyGuard.sol
+```
 
-        uint256 amount = deposits[msg.sender];
+### Deploy
 
-        require(amount > 0, "Nothing to withdraw");
-        require(address(this).balance >= amount, "Insufficient contract balance");
+```solidity
+// Deploy with initial owner address
+EscrowMarketPlace escrow = new EscrowMarketPlace(ownerAddress);
+```
 
-        deposits[msg.sender] = 0;
-        hasDeposited[msg.sender] = false;
+## Events
 
-        (bool success,) = payable(msg.sender).call{value: amount}("");
+The contract emits the following events for tracking:
 
-        if (!success) {
-            revert TransactionFailed();
-        }
-    }
+- `TransactionCreated`: When a new transaction is created
+- `BoughtItem`: When an item is purchased
+- `DepositedFunds`: When a user deposits funds
+- `DeliveryConfirmed`: When delivery is approved
+- `RefundIssued`: When a refund is processed
+- `DisputeRaised`: When a dispute is raised
+- `DisputeResolved`: When a dispute is resolved
+- `EscrowCanceled`: When a transaction is canceled
+- `FeeUpdated`: When platform fee is changed
+- `FeeRecipientUpdated`: When fee recipient address is changed
 
-    function withdraw() external nonReentrant {
-        uint256 amount = pendingWithdrawals[msg.sender];
+## Testing
 
-        require(amount > 0, "Nothing to withdraw");
+Recommended testing scenarios:
 
-        pendingWithdrawals[msg.sender] = 0;
+- [ ] Deposit and withdrawal flow
+- [ ] Complete transaction lifecycle (create → buy → deliver → withdraw)
+- [ ] Refund after deadline
+- [ ] Dispute resolution by arbitrator
+- [ ] Fee calculations
+- [ ] Reentrancy attack prevention
+- [ ] Access control for different roles
 
-        (bool success,) = payable(msg.sender).call{value: amount}("");
-        require(success, "Transfer failed");
-    }
+## Future Improvements
 
-    function refundBuyer(uint256 _id) external onlySeller nonReentrant {
-        Transaction storage transact = transactions[_id];
+- Multi-token support (not just ETH)
+- Automated dispute resolution with decentralized oracles
+- Reputation system for buyers and sellers
+- NFT-based arbitrator credentials
+- Enhanced dispute evidence submission system
 
-        require(transact.seller == msg.sender, "Not transaction seller");
+## License
 
-        require(transact.itemSold == true, "Buyer never purchased");
+This project is licensed under the MIT License - see the SPDX identifier in the contract.
 
-        require(transact.status == Status.Canceled, "Transaction not canceled");
+---
 
-        require(transact.buyer != address(0), "No buyer to refund");
-
-        transact.status = Status.Refunded;
-
-        totalEscrowed -= transact.amount;
-        pendingWithdrawals[address(this)] -= transact.amount;
-        pendingWithdrawals[transact.buyer] += transact.amount;
-
-        lockedInTransaction[transact.seller] = false;
-
-        emit RefundIssued(_id);
-    }
-
-
-        function cancelEscrow(uint256 _id) external nonReentrant {
-            Transaction storage transact = transactions[_id];
-
-            require(transact.seller == msg.sender, "Not transaction seller");
-            require(transact.status == Status.Created, "Cannot cancel after purchase");
-
-            transact.status = Status.Canceled;
-
-            if (transact.itemSold) {
-                transact.itemSold = false;
-
-                require(pendingWithdrawals[address(this)] >= transact.amount, "Insufficient escrow balance");
-
-                totalEscrowed -= transact.amount;
-                pendingWithdrawals[address(this)] -= transact.amount;
-                pendingWithdrawals[transact.buyer] += transact.amount;
-            }
-
-            lockedInTransaction[transact.seller] = false;
-
-            emit EscrowCanceled(_id, msg.sender);
-    }
-
-
-    function raiseDispute(uint256 _id) external {
-        require(transactions[_id].seller != address(0), "Transaction does not exist");
-
-        Transaction storage transact = transactions[_id];
-
-        require(transact.buyer == msg.sender, "Not this transaction's buyer");
-
-        require(transact.status == Status.Pending, "Can only dispute pending transactions");
-
-        transact.status = Status.Disputed;
-
-        emit DisputeRaised(_id);
-    }
-
-    function resolveDispute(uint256 _id, address _winner)
-        external
-        onlyArbitrator{
-
-        require(_winner != address(0), "Enter a valid address");
-
-        Transaction storage transact = transactions[_id];
-
-        require(msg.sender == transact.arbitrator);
-
-
-        require(transact.status == Status.Disputed, "No active dispute");
-
-        require(_winner == transact.buyer || _winner == transact.seller, "Invalid winner");
-
-        transact.status = Status.Resolved;
-
-        if (_winner == transact.buyer) {
-
-            totalEscrowed -= transact.amount;
-            pendingWithdrawals[address(this)] -= transact.amount;
-            pendingWithdrawals[transact.buyer] += transact.amount;
-        } else {
-
-            totalEscrowed -= transact.amount;
-            pendingWithdrawals[address(this)] -= transact.amount;
-            pendingWithdrawals[transact.seller] += transact.amount;
-        }
-
-        emit DisputeResolved(_id, _winner);
-    }
-    
-    function getEscrowDetails(uint256 _id) external view 
-        returns (address buyer, address seller, uint256 amount, Status status) {
-
-            Transaction storage transact = transactions[_id];
-            
-            return (transact.buyer, transact.seller, transact.amount, transact.status);     
-    }
-
-    receive() external payable { 
-        revert Usedeposit(); 
-    }
-}# myFirstSolidityEscrowProject
-This is my first attempt on writing a professional Escrow contract using solidity
+**Note**: This is a learning project. Conduct thorough security audits before deploying to mainnet.
